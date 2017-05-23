@@ -16,6 +16,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
@@ -437,19 +438,19 @@ func (e *Email) parseSender() (string, error) {
 // SendWithTLS sends an email with an optional TLS config.
 // This is helpful if you need to connect to a host that is used an untrusted
 // certificate.
-func (e *Email) SendWithTLS(addr string, a smtp.Auth, t *tls.Config) error {
+func (e *Email) SendWithTLS(addr string, auth smtp.Auth, tlsconfig *tls.Config) error {
 	// Merge the To, Cc, and Bcc fields
-	to := make([]string, 0, len(e.To)+len(e.Cc)+len(e.Bcc))
-	to = append(append(append(to, e.To...), e.Cc...), e.Bcc...)
-	for i := 0; i < len(to); i++ {
-		addr, err := mail.ParseAddress(to[i])
+	tos := make([]string, 0, len(e.To)+len(e.Cc)+len(e.Bcc))
+	tos = append(append(append(tos, e.To...), e.Cc...), e.Bcc...)
+	for i := 0; i < len(tos); i++ {
+		addr, err := mail.ParseAddress(tos[i])
 		if err != nil {
 			return err
 		}
-		to[i] = addr.Address
+		tos[i] = addr.Address
 	}
-	// Check to make sure there is at least one recipient and one "From" address
-	if e.From == "" || len(to) == 0 {
+	// Check tos make sure there is at least one recipient and one "From" address
+	if e.From == "" || len(tos) == 0 {
 		return errors.New("Must specify at least one From address and one To address")
 	}
 	sender, err := e.parseSender()
@@ -460,50 +461,53 @@ func (e *Email) SendWithTLS(addr string, a smtp.Auth, t *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	// Taken from the standard library
-	// https://github.com/golang/go/blob/master/src/net/smtp/smtp.go#L300
-	c, err := smtp.Dial(addr)
+
+	// Here is the key, you need to call tls.Dial instead of smtp.Dial
+	// for smtp servers running on 465 that require an ssl connection
+	// from the very beginning (no starttls)
+	conn, err := tls.Dial("tcp", addr, tlsconfig)
 	if err != nil {
 		return err
 	}
-	defer c.Close()
-	if err = c.Hello("localhost"); err != nil {
+
+	host, _, _ := net.SplitHostPort(addr)
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
 		return err
 	}
-	// Use TLS if available
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		if err = c.StartTLS(t); err != nil {
+
+	// Auth
+	if err = c.Auth(auth); err != nil {
+		return err
+	}
+	
+	// To && From
+	if err = c.Mail(sender); err != nil {
+		return err
+	}
+
+	for _, to := range tos {
+		if err = c.Rcpt(to); err != nil {
 			return err
 		}
 	}
 
-	if a != nil {
-		if ok, _ := c.Extension("AUTH"); ok {
-			if err = c.Auth(a); err != nil {
-				return err
-			}
-		}
-	}
-	if err = c.Mail(sender); err != nil {
-		return err
-	}
-	for _, addr := range to {
-		if err = c.Rcpt(addr); err != nil {
-			return err
-		}
-	}
+	// Data
 	w, err := c.Data()
 	if err != nil {
 		return err
 	}
+
 	_, err = w.Write(raw)
 	if err != nil {
 		return err
 	}
+
 	err = w.Close()
 	if err != nil {
 		return err
 	}
+
 	return c.Quit()
 }
 
