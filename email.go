@@ -47,7 +47,6 @@ type Email struct {
 	Subject     string
 	Text        []byte // Plaintext message (optional)
 	HTML        []byte // Html message (optional)
-	Sender      string // override From as SMTP envelope sender (optional)
 	Headers     textproto.MIMEHeader
 	Attachments []*Attachment
 	ReadReceipt []string
@@ -230,8 +229,6 @@ func (e *Email) AttachFile(filename string) (a *Attachment, err error) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
-
 	ct := mime.TypeByExtension(filepath.Ext(filename))
 	basename := filepath.Base(filename)
 	return e.Attach(f, basename, ct)
@@ -246,7 +243,7 @@ func (e *Email) AttachFile(filename string) (a *Attachment, err error) {
 func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 	res := make(textproto.MIMEHeader, len(e.Headers)+4)
 	if e.Headers != nil {
-		for _, h := range []string{"To", "Cc", "From", "Subject", "Date", "Message-Id", "MIME-Version"} {
+		for _, h := range []string{"To", "Cc", "From", "Subject", "Date", "Message-Id"} {
 			if v, ok := e.Headers[h]; ok {
 				res[h] = v
 			}
@@ -276,8 +273,8 @@ func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 	if _, ok := res["Date"]; !ok {
 		res.Set("Date", time.Now().Format(time.RFC1123Z))
 	}
-	if _, ok := res["MIME-Version"]; !ok {
-		res.Set("MIME-Version", "1.0")
+	if _, ok := res["Mime-Version"]; !ok {
+		res.Set("Mime-Version", "1.0")
 	}
 	for field, vals := range e.Headers {
 		if _, ok := res[field]; !ok {
@@ -285,25 +282,6 @@ func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 		}
 	}
 	return res, nil
-}
-
-func writeMessage(buff *bytes.Buffer, msg []byte, multipart bool, mediaType string, w *multipart.Writer) error {
-	if multipart {
-		header := textproto.MIMEHeader{
-			"Content-Type":              {mediaType + "; charset=UTF-8"},
-			"Content-Transfer-Encoding": {"quoted-printable"},
-		}
-		if _, err := w.CreatePart(header); err != nil {
-			return err
-		}
-	}
-
-	qp := quotedprintable.NewWriter(buff)
-	// Write the text
-	if _, err := qp.Write(msg); err != nil {
-		return err
-	}
-	return qp.Close()
 }
 
 // Bytes converts the Email object to a []byte representation, including all needed MIMEHeaders, boundaries, etc.
@@ -315,62 +293,55 @@ func (e *Email) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var (
-		isMixed       = len(e.Attachments) > 0
-		isAlternative = len(e.Text) > 0 && len(e.HTML) > 0
-	)
-
-	var w *multipart.Writer
-	if isMixed || isAlternative {
-		w = multipart.NewWriter(buff)
-	}
-	switch {
-	case isMixed:
-		headers.Set("Content-Type", "multipart/mixed;\r\n boundary="+w.Boundary())
-	case isAlternative:
-		headers.Set("Content-Type", "multipart/alternative;\r\n boundary="+w.Boundary())
-	case len(e.HTML) > 0:
-		headers.Set("Content-Type", "text/html; charset=UTF-8")
-	default:
-		headers.Set("Content-Type", "text/plain; charset=UTF-8")
-	}
+	w := multipart.NewWriter(buff)
+	// TODO: determine the content type based on message/attachment mix.
+	headers.Set("Content-Type", "multipart/mixed;\r\n boundary="+w.Boundary())
 	headerToBytes(buff, headers)
 	io.WriteString(buff, "\r\n")
 
+	// Start the multipart/mixed part
+	fmt.Fprintf(buff, "--%s\r\n", w.Boundary())
+	header := textproto.MIMEHeader{}
 	// Check to see if there is a Text or HTML field
 	if len(e.Text) > 0 || len(e.HTML) > 0 {
-		var subWriter *multipart.Writer
-
-		if isMixed && isAlternative {
-			// Create the multipart alternative part
-			subWriter = multipart.NewWriter(buff)
-			header := textproto.MIMEHeader{
-				"Content-Type": {"multipart/alternative;\r\n boundary=" + subWriter.Boundary()},
-			}
-			if _, err := w.CreatePart(header); err != nil {
-				return nil, err
-			}
-		} else {
-			subWriter = w
-		}
+		subWriter := multipart.NewWriter(buff)
+		// Create the multipart alternative part
+		header.Set("Content-Type", fmt.Sprintf("multipart/alternative;\r\n boundary=%s\r\n", subWriter.Boundary()))
+		// Write the header
+		headerToBytes(buff, header)
 		// Create the body sections
 		if len(e.Text) > 0 {
+			header.Set("Content-Type", fmt.Sprintf("text/plain; charset=UTF-8"))
+			header.Set("Content-Transfer-Encoding", "quoted-printable")
+			if _, err := subWriter.CreatePart(header); err != nil {
+				return nil, err
+			}
+			qp := quotedprintable.NewWriter(buff)
 			// Write the text
-			if err := writeMessage(buff, e.Text, isMixed || isAlternative, "text/plain", subWriter); err != nil {
+			if _, err := qp.Write(e.Text); err != nil {
+				return nil, err
+			}
+			if err := qp.Close(); err != nil {
 				return nil, err
 			}
 		}
 		if len(e.HTML) > 0 {
+			header.Set("Content-Type", fmt.Sprintf("text/html; charset=UTF-8"))
+			header.Set("Content-Transfer-Encoding", "quoted-printable")
+			if _, err := subWriter.CreatePart(header); err != nil {
+				return nil, err
+			}
+			qp := quotedprintable.NewWriter(buff)
 			// Write the HTML
-			if err := writeMessage(buff, e.HTML, isMixed || isAlternative, "text/html", subWriter); err != nil {
+			if _, err := qp.Write(e.HTML); err != nil {
+				return nil, err
+			}
+			if err := qp.Close(); err != nil {
 				return nil, err
 			}
 		}
-		if isMixed && isAlternative {
-			if err := subWriter.Close(); err != nil {
-				return nil, err
-			}
+		if err := subWriter.Close(); err != nil {
+			return nil, err
 		}
 	}
 	// Create attachment part, if necessary
@@ -382,10 +353,8 @@ func (e *Email) Bytes() ([]byte, error) {
 		// Write the base64Wrapped content to the part
 		base64Wrap(ap, a.Content)
 	}
-	if isMixed || isAlternative {
-		if err := w.Close(); err != nil {
-			return nil, err
-		}
+	if err := w.Close(); err != nil {
+		return nil, err
 	}
 	return buff.Bytes(), nil
 }
@@ -407,7 +376,7 @@ func (e *Email) Send(addr string, a smtp.Auth) error {
 	if e.From == "" || len(to) == 0 {
 		return errors.New("Must specify at least one From address and one To address")
 	}
-	sender, err := e.parseSender()
+	from, err := mail.ParseAddress(e.From)
 	if err != nil {
 		return err
 	}
@@ -415,24 +384,7 @@ func (e *Email) Send(addr string, a smtp.Auth) error {
 	if err != nil {
 		return err
 	}
-	return smtp.SendMail(addr, a, sender, to, raw)
-}
-
-// Select and parse an SMTP envelope sender address.  Choose Email.Sender if set, or fallback to Email.From.
-func (e *Email) parseSender() (string, error) {
-	if e.Sender != "" {
-		sender, err := mail.ParseAddress(e.Sender)
-		if err != nil {
-			return "", err
-		}
-		return sender.Address, nil
-	} else {
-		from, err := mail.ParseAddress(e.From)
-		if err != nil {
-			return "", err
-		}
-		return from.Address, nil
-	}
+	return smtp.SendMail(addr, a, from.Address, to, raw)
 }
 
 // SendWithTLS sends an email with an optional TLS config.
@@ -453,7 +405,7 @@ func (e *Email) SendWithTLS(addr string, auth smtp.Auth, tlsconfig *tls.Config) 
 	if e.From == "" || len(tos) == 0 {
 		return errors.New("Must specify at least one From address and one To address")
 	}
-	sender, err := e.parseSender()
+	from, err := mail.ParseAddress(e.From)
 	if err != nil {
 		return err
 	}
@@ -480,9 +432,9 @@ func (e *Email) SendWithTLS(addr string, auth smtp.Auth, tlsconfig *tls.Config) 
 	if err = c.Auth(auth); err != nil {
 		return err
 	}
-	
+
 	// To && From
-	if err = c.Mail(sender); err != nil {
+	if err = c.Mail(from.Address); err != nil {
 		return err
 	}
 
